@@ -87,8 +87,8 @@ class AudioProcessingToolTest {
                 0.0,
                 0.0);
 
-        assertThat(profile).contains("results/room.noise-profile");
-        assertThat(reduce).contains("results/clean.wav");
+        assertThat(profile).contains(Path.of("results", "room.noise-profile").toString());
+        assertThat(reduce).contains(Path.of("results", "clean.wav").toString());
         assertThat(fixture.executor.commands.get(0))
                 .containsSubsequence("-n", "noiseprof");
         assertThat(fixture.executor.commands.get(1))

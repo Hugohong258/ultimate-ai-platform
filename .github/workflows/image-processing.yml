@@ -1,0 +1,46 @@
+name: Native image processing
+
+on:
+  pull_request:
+    paths:
+      - 'server/**'
+      - 'docs/image-processing.md'
+      - '.github/workflows/image-processing.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'docs/image-processing.md'
+      - '.github/workflows/image-processing.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native-image-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Prepare pinned ImageMagick without FUSE
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fL --retry 3 'https://github.com/ImageMagick/ImageMagick/releases/download/7.1.2-34/ImageMagick-7.1.2-34-gcc-x86_64.AppImage' -o magick.AppImage
+          echo '6e9edfd35d5f30b57c27533afe003d6085faaf8607b207426f398d11751acf93  magick.AppImage' | sha256sum -c -
+          chmod +x magick.AppImage
+          ./magick.AppImage --appimage-extract >/dev/null
+          "$RUNNER_TEMP/squashfs-root/AppRun" -version
+          echo "IMAGE_MAGICK=$RUNNER_TEMP/squashfs-root/AppRun" >> "$GITHUB_ENV"
+      - name: Run native, isolation, process and discovery tests
+        working-directory: server
+        shell: bash
+        run: |
+          chmod +x mvnw
+          ./mvnw -B -ntp -Dultimate.image.integration.binary="$IMAGE_MAGICK" -Dtest=ImageProcessingDiscoveryTest,ImageProcessingToolTest,ImageProcessingNativeTest,ImageProcessRunnerTest test
