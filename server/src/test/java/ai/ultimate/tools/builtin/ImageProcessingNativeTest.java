@@ -151,6 +151,23 @@ class ImageProcessingNativeTest {
         clean();
     }
 
+    @Test void processesATwelveMegapixelImageWithinTheNativeResourceLimits() throws Exception {
+        var large = new BufferedImage(4000, 3000, BufferedImage.TYPE_INT_RGB);
+        var graphics = large.createGraphics();
+        try {
+            graphics.setPaint(new java.awt.GradientPaint(0, 0, Color.BLUE, 4000, 3000, Color.ORANGE));
+            graphics.fillRect(0, 0, 4000, 3000);
+        } finally { graphics.dispose(); }
+        ImageIO.write(large, "png", workspace.resolve("large.png").toFile());
+        assertThat(run(List.of("large.png"), "large-result", "resize", "webp", 2000, 2000, 0, 0, 0, 0, ""))
+                .startsWith("Image processing completed");
+        var info = runner.run(List.of(binary, "identify", "-format", "%m %w %h",
+                workspace.resolve("large-result/image-01.webp").toString()), workspace, Map.of(), Duration.ofSeconds(5));
+        assertThat(info.exitCode()).isZero();
+        assertThat(info.output()).isEqualTo("WEBP 2000 1500");
+        clean();
+    }
+
     @Test void processesTenImagesAndKeepsConcurrentBatchesSeparate() throws Exception {
         List<String> inputs = new ArrayList<>();
         for (int i = 0; i < 10; i++) {
