@@ -7,7 +7,6 @@ on:
       - 'docs/image-processing.md'
       - '.github/workflows/image-processing.yml'
   push:
-    branches: [main]
     paths:
       - 'server/**'
       - 'docs/image-processing.md'
@@ -38,9 +37,17 @@ jobs:
           ./magick.AppImage --appimage-extract >/dev/null
           "$RUNNER_TEMP/squashfs-root/AppRun" -version
           echo "IMAGE_MAGICK=$RUNNER_TEMP/squashfs-root/AppRun" >> "$GITHUB_ENV"
-      - name: Run native, isolation, process and discovery tests
+      - name: Verify server with native image tests
         working-directory: server
         shell: bash
         run: |
           chmod +x mvnw
-          ./mvnw -B -ntp -Dultimate.image.integration.binary="$IMAGE_MAGICK" -Dtest=ImageProcessingDiscoveryTest,ImageProcessingToolTest,ImageProcessingNativeTest,ImageProcessRunnerTest test
+          printf '%s\n' '<settings><mirrors><mirror><id>central-native-tests</id><mirrorOf>*</mirrorOf><url>https://repo.maven.apache.org/maven2</url></mirror></mirrors></settings>' > "$RUNNER_TEMP/image-maven-settings.xml"
+          ./mvnw -B -ntp -s "$RUNNER_TEMP/image-maven-settings.xml" -Dultimate.image.integration.binary="$IMAGE_MAGICK" clean verify
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: native-image-test-results
+          path: server/target/surefire-reports/
+          if-no-files-found: warn
