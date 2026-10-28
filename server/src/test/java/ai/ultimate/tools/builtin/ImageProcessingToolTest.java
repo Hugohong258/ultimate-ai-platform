@@ -288,7 +288,7 @@ class ImageProcessingToolTest {
             return new ImageProcessRunner.Result(1, false, "intentional native failure");
         }, Duration.ofSeconds(10));
         assertThat(convert(tool, configuredRoot.resolve("tenant-a"), List.of("input.png"), ".", "out")).contains("NATIVE_ERROR");
-        assertThat(convert(tool, workspace, List.of("input.png"), ".", "out")).contains("NATIVE_ERROR");
+        assertThat(convert(tool, workspace.toRealPath(), List.of("input.png"), ".", "out")).contains("NATIVE_ERROR");
         assertThat(executions.get()).isEqualTo(2);
         Files.createSymbolicLink(realParent.resolve("managed/linked-tenant"), workspace);
         assertThat(convert(tool, configuredRoot.resolve("linked-tenant"), List.of("input.png"), ".", "out"))
