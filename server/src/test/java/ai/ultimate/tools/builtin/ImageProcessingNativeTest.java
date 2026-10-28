@@ -53,7 +53,7 @@ class ImageProcessingNativeTest {
     @Test void convertsRealJpegAndPngToWebpAndPreservesInputs() throws Exception {
         byte[] original = Files.readAllBytes(workspace.resolve("with spaces.png"));
         assertThat(run(List.of("with spaces.png", "input.jpeg"), "converted", "convert", "webp", 0, 0, 0, 0, 0, 0, ""))
-                .startsWith("Image processing completed");
+                .contains("Image processing completed");
         for (int i = 1; i <= 2; i++) {
             Path output = workspace.resolve("converted/image-0" + i + ".webp");
             byte[] bytes = Files.readAllBytes(output);
@@ -70,9 +70,9 @@ class ImageProcessingNativeTest {
 
     @Test void resizesAndRendersLiteralWatermarkPixels() throws Exception {
         assertThat(run(List.of("with spaces.png"), "plain", "resize", "png", 64, 64, 0, 0, 0, 0, ""))
-                .startsWith("Image processing completed");
+                .contains("Image processing completed");
         assertThat(run(List.of("with spaces.png"), "marked", "resize", "png", 64, 64, 0, 0, 0, 0, "%@"))
-                .startsWith("Image processing completed");
+                .contains("Image processing completed");
         var plain = ImageIO.read(workspace.resolve("plain/image-01.png").toFile());
         var marked = ImageIO.read(workspace.resolve("marked/image-01.png").toFile());
         assertThat(plain.getWidth()).isEqualTo(64);
@@ -83,13 +83,13 @@ class ImageProcessingNativeTest {
 
     @Test void cropsExactRectangleAndActuallyAdjustsColor() throws Exception {
         assertThat(run(List.of("with spaces.png"), "crop", "crop", "png", 16, 20, 4, 6, 0, 0, ""))
-                .startsWith("Image processing completed");
+                .contains("Image processing completed");
         var cropped = ImageIO.read(workspace.resolve("crop/image-01.png").toFile());
         assertThat(cropped.getWidth()).isEqualTo(16);
         assertThat(cropped.getHeight()).isEqualTo(20);
         assertThat(new Color(cropped.getRGB(0, 0)).getRed()).isBetween(62, 66);
         assertThat(run(List.of("with spaces.png"), "color", "color-correct", "png", 0, 0, 0, 0, 30, 0, ""))
-                .startsWith("Image processing completed");
+                .contains("Image processing completed");
         var adjusted = ImageIO.read(workspace.resolve("color/image-01.png").toFile());
         assertThat(new Color(adjusted.getRGB(0, 0)).getRed()).isGreaterThan(80);
         assertThat(run(List.of("with spaces.png"), "invalid", "crop", "png", 16, 20, 120, 90, 0, 0, ""))
@@ -106,7 +106,7 @@ class ImageProcessingNativeTest {
         assertThat(new String(Files.readAllBytes(annotated), java.nio.charset.StandardCharsets.ISO_8859_1))
                 .contains("PRIVATE_META_SENTINEL");
         assertThat(run(List.of("private.jpeg"), "stripped", "convert", "jpeg", 0, 0, 0, 0, 0, 0, ""))
-                .startsWith("Image processing completed");
+                .contains("Image processing completed");
         String output = new String(Files.readAllBytes(workspace.resolve("stripped/image-01.jpeg")), java.nio.charset.StandardCharsets.ISO_8859_1);
         assertThat(output).doesNotContain("PRIVATE_META_SENTINEL");
         clean();
@@ -129,7 +129,7 @@ class ImageProcessingNativeTest {
         bytes.write(tiff.array()); bytes.write(jpeg, 2, jpeg.length - 2);
         Files.write(workspace.resolve("oriented.jpeg"), bytes.toByteArray());
         assertThat(run(List.of("oriented.jpeg"), "oriented", "convert", "png", 0, 0, 0, 0, 0, 0, ""))
-                .startsWith("Image processing completed");
+                .contains("Image processing completed");
         Path output = workspace.resolve("oriented/image-01.png");
         var image = ImageIO.read(output.toFile());
         assertThat(image.getWidth()).isEqualTo(96);
@@ -137,7 +137,7 @@ class ImageProcessingNativeTest {
         assertThat(new String(Files.readAllBytes(output), java.nio.charset.StandardCharsets.ISO_8859_1))
                 .doesNotContain("PRIVATE_EXIF_SENTINEL");
         assertThat(run(List.of("oriented.jpeg"), "oriented-crop", "crop", "png", 32, 110, 0, 0, 0, 0, ""))
-                .startsWith("Image processing completed");
+                .contains("Image processing completed");
         assertThat(ImageIO.read(workspace.resolve("oriented-crop/image-01.png").toFile()).getHeight()).isEqualTo(110);
         clean();
     }
@@ -160,7 +160,7 @@ class ImageProcessingNativeTest {
         } finally { graphics.dispose(); }
         ImageIO.write(large, "png", workspace.resolve("large.png").toFile());
         assertThat(run(List.of("large.png"), "large-result", "resize", "webp", 2000, 2000, 0, 0, 0, 0, ""))
-                .startsWith("Image processing completed");
+                .contains("Image processing completed");
         var info = runner.run(List.of(binary, "identify", "-format", "%m %w %h",
                 workspace.resolve("large-result/image-01.webp").toString()), workspace, Map.of(), Duration.ofSeconds(5));
         assertThat(info.exitCode()).isZero();
@@ -178,8 +178,8 @@ class ImageProcessingNativeTest {
         try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
             var first = executor.submit(() -> run(inputs, "batch-a", "resize", "png", 32, 32, 0, 0, 0, 0, ""));
             var second = executor.submit(() -> run(List.of("input.jpeg"), "batch-b", "convert", "png", 0, 0, 0, 0, 0, 0, ""));
-            assertThat(first.get()).startsWith("Image processing completed");
-            assertThat(second.get()).startsWith("Image processing completed");
+            assertThat(first.get()).contains("Image processing completed");
+            assertThat(second.get()).contains("Image processing completed");
         }
         try (var paths = Files.list(workspace.resolve("batch-a"))) { assertThat(paths.count()).isEqualTo(10); }
         assertThat(workspace.resolve("batch-b/image-01.png")).exists();

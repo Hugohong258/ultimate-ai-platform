@@ -1,6 +1,8 @@
 package ai.ultimate.tools.builtin;
 
 import ai.ultimate.tools.UltimateTool;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -11,6 +13,8 @@ import java.awt.Color;
 import java.awt.Font;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import java.awt.color.ColorSpace;
+import java.awt.color.ICC_Profile;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -25,6 +29,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Semaphore;
 
 /** Bounded raster processing; workspace authorization belongs to the invoking host. */
@@ -35,12 +40,21 @@ public class ImageProcessingTool implements UltimateTool {
     private static final Semaphore CAPACITY = new Semaphore(2);
     private static final Set<String> OPERATIONS = Set.of("convert", "resize", "crop", "color-correct");
     private static final Set<String> FORMATS = Set.of("png", "jpeg", "webp");
+    private static final ObjectMapper JSON = new ObjectMapper();
+    private static final System.Logger LOG = System.getLogger(ImageProcessingTool.class.getName());
+    private record Artifact(String path, String format, int width, int height, long bytes) { }
+    private record Reply(String requestId, String status, String code, String message, List<Artifact> artifacts) { }
+    private static final class Failure extends IOException {
+        final String code;
+        Failure(String code, String message) { super(message); this.code = code; }
+    }
     private static final String POLICY = """
             <policymap>
               <policy domain="delegate" rights="none" pattern="*"/>
               <policy domain="filter" rights="none" pattern="*"/>
               <policy domain="coder" rights="none" pattern="*"/>
               <policy domain="coder" rights="read|write" pattern="{PNG,JPEG,WEBP,INFO}"/>
+              <policy domain="coder" rights="read" pattern="{ICC,ICM}"/>
               <policy domain="path" rights="none" pattern="@*"/>
               <policy domain="resource" name="memory" value="128MiB"/>
               <policy domain="resource" name="map" value="256MiB"/>
@@ -71,17 +85,19 @@ public class ImageProcessingTool implements UltimateTool {
         this.budget = budget;
     }
 
-    @Tool(description = "Process 1-10 local JPEG/PNG images in an authorized managed workspace. "
+    @Tool(description = "Process 1-10 local JPEG/PNG/WebP images in an authorized managed workspace. "
             + "Convert to png/jpeg/webp, resize to fit a width/height box without upscaling, "
             + "crop after EXIF orientation using pixel offsets, or color-correct brightness/contrast. "
             + "All operations strip metadata and optionally add a literal text watermark. "
             + "Outputs are published together in a NEW named folder under outputDirectory; "
-            + "existing files/folders are never overwritten. Returns output paths or an error string. "
+            + "existing files/folders are never overwritten. Returns JSON with requestId, status, code, message "
+            + "and verified artifacts (relative path, format, width, height, bytes). JPEG transparency is flattened "
+            + "onto white; PNG/WebP preserve alpha. WebP quality 100 is lossless. "
             + "Limits: 25MiB per input, 100MiB total, dimensions 8192, 60 seconds per batch.")
     public String processImages(
             @ToolParam(description = "Authorized absolute directory below ~/ultimate-managed-workspaces")
             String workspacePath,
-            @ToolParam(description = "List of existing relative JPEG/PNG input paths") List<String> inputPaths,
+            @ToolParam(description = "List of existing relative JPEG/PNG/WebP input paths; first frame only") List<String> inputPaths,
             @ToolParam(description = "Existing relative output parent directory, for example results or .")
             String outputDirectory,
             @ToolParam(description = "New output folder name: letters, numbers, underscores or hyphens")
@@ -99,14 +115,19 @@ public class ImageProcessingTool implements UltimateTool {
             String watermark) {
         Path runtime = null;
         boolean acquired = false;
-        String result;
+        String requestId = UUID.randomUUID().toString();
+        List<Artifact> published = List.of();
+        Reply result;
         try {
             validate(inputPaths, outputName, operation, outputFormat, width, height,
                     offsetX, offsetY, quality, brightness, contrast, watermark);
-            if (!CAPACITY.tryAcquire()) return "Image Processing Busy: two batches are already running.";
+            if (!CAPACITY.tryAcquire()) return encode(new Reply(requestId, "error", "BUSY",
+                    "Image Processing Busy: two batches are already running.", List.of()));
             acquired = true;
             long deadline = System.nanoTime() + budget.toNanos();
             Path root = managedRoot.toRealPath();
+            if (workspacePath == null || !Path.of(workspacePath).isAbsolute())
+                throw new IllegalArgumentException("Workspace path must be absolute.");
             Path workspace = Path.of(workspacePath).toAbsolutePath().normalize();
             if (workspace.equals(root) || !workspace.startsWith(root))
                 throw new IllegalArgumentException("Workspace must be below the managed root.");
@@ -131,29 +152,38 @@ public class ImageProcessingTool implements UltimateTool {
             runtime = Files.createTempDirectory(workspace, ".ultimate-image-").toRealPath();
             Path results = Files.createDirectory(runtime.resolve("results"));
             Files.writeString(runtime.resolve("policy.xml"), POLICY);
+            Path srgb = runtime.resolve("srgb.icc");
+            Files.write(srgb, ICC_Profile.getInstance(ColorSpace.CS_sRGB).getData());
             Map<String, String> environment = Map.of(
                     "MAGICK_CONFIGURE_PATH", runtime.toString(),
                     "MAGICK_TEMPORARY_PATH", runtime.toString(),
                     "TMPDIR", runtime.toString(), "TEMP", runtime.toString(), "TMP", runtime.toString());
             long stagedBytes = 0;
+            List<Artifact> artifacts = new ArrayList<>();
             for (int index = 0; index < inputs.size(); index++) {
                 Path staged = runtime.resolve("input-" + index + ".image");
+                contained(workspace, inputs.get(index), false);
                 stagedBytes += stage(inputs.get(index), staged, deadline, BATCH_LIMIT - stagedBytes);
+                contained(workspace, inputs.get(index), false);
                 String coder = inputCoder(staged);
                 String image = coder + ":" + staged + "[0]";
                 List<String> probe = command();
                 probe.addAll(List.of(image, "-auto-orient", "-format", "%w %h", "info:"));
                 String dimensions = execute(probe, runtime, environment, deadline).trim();
-                if (!dimensions.matches("[0-9]+ [0-9]+")) throw new IOException("Invalid image dimensions.");
+                if (!dimensions.matches("[0-9]+ [0-9]+")) {
+                    LOG.log(System.Logger.Level.WARNING, "Invalid probe output: {0}", bounded(dimensions));
+                    throw new Failure("INVALID_IMAGE", "Invalid image dimensions.");
+                }
                 String[] parts = dimensions.split(" ");
                 int actualWidth = Integer.parseInt(parts[0]);
                 int actualHeight = Integer.parseInt(parts[1]);
+                checkDimensions(actualWidth, actualHeight);
                 if ("crop".equals(operation)
                         && ((long) offsetX + width > actualWidth || (long) offsetY + height > actualHeight))
                     throw new IllegalArgumentException("Crop rectangle exceeds oriented image dimensions.");
 
                 List<String> command = command();
-                command.addAll(List.of(image, "-auto-orient", "-colorspace", "sRGB"));
+                command.addAll(List.of(image, "-auto-orient", "-profile", srgb.toString(), "-colorspace", "sRGB"));
                 if ("resize".equals(operation)) command.addAll(List.of("-resize", width + "x" + height + ">"));
                 if ("crop".equals(operation))
                     command.addAll(List.of("-crop", width + "x" + height + "+" + offsetX + "+" + offsetY, "+repage"));
@@ -169,37 +199,69 @@ public class ImageProcessingTool implements UltimateTool {
                     command.addAll(List.of("PNG:" + overlay, "-gravity", "southeast", "-compose", "over", "-composite"));
                 }
                 Path output = results.resolve(String.format(Locale.ROOT, "image-%02d.%s", index + 1, outputFormat));
+                if ("jpeg".equals(outputFormat))
+                    command.addAll(List.of("-background", "white", "-alpha", "remove", "-alpha", "off"));
+                if ("webp".equals(outputFormat) && quality == 100)
+                    command.addAll(List.of("-define", "webp:lossless=true"));
                 command.addAll(List.of("-strip", "-quality", Integer.toString(quality),
                         outputFormat.toUpperCase(Locale.ROOT) + ":" + output));
                 execute(command, runtime, environment, deadline);
                 if (!Files.isRegularFile(output, LinkOption.NOFOLLOW_LINKS) || Files.size(output) == 0)
                     throw new IOException("ImageMagick did not produce a nonempty image.");
                 if (Files.size(output) > FILE_LIMIT) throw new IOException("Output exceeds 25MiB.");
+                List<String> verify = command();
+                verify.addAll(List.of(outputFormat.toUpperCase(Locale.ROOT) + ":" + output,
+                        "-format", "%m %w %h", "info:"));
+                String properties = execute(verify, runtime, environment, deadline).trim();
+                String[] fields = properties.split(" ");
+                if (fields.length != 3 || !fields[0].equalsIgnoreCase(outputFormat)
+                        || !fields[1].matches("[0-9]+") || !fields[2].matches("[0-9]+"))
+                    throw new Failure("OUTPUT_INVALID", "Unexpected output format or dimensions.");
+                int outputWidth = Integer.parseInt(fields[1]), outputHeight = Integer.parseInt(fields[2]);
+                checkDimensions(outputWidth, outputHeight);
+                double scale = "resize".equals(operation)
+                        ? Math.min(1, Math.min((double) width / actualWidth, (double) height / actualHeight)) : 1;
+                int expectedWidth = "crop".equals(operation) ? width : Math.max(1, (int) Math.round(actualWidth * scale));
+                int expectedHeight = "crop".equals(operation) ? height : Math.max(1, (int) Math.round(actualHeight * scale));
+                if (outputWidth != expectedWidth || outputHeight != expectedHeight)
+                    throw new Failure("OUTPUT_INVALID", "Output dimensions do not match the requested operation.");
+                artifacts.add(new Artifact(workspace.relativize(target.resolve(output.getFileName())).toString()
+                        .replace('\\', '/'), outputFormat, outputWidth, outputHeight, Files.size(output)));
             }
             // Recheck the destination before publishing; do not replace a concurrently created target.
             if (!contained(workspace, outputParent, true).equals(outputParent))
                 throw new IOException("Output directory changed during execution.");
             remaining(deadline);
             Files.move(results, target);
-            result = "Image processing completed: " + workspace.relativize(target)
-                    + " (" + inputs.size() + " images).";
+            published = List.copyOf(artifacts);
+            result = new Reply(requestId, "ok", "OK", "Image processing completed.", published);
         } catch (IllegalArgumentException e) {
-            result = "Image Validation Error: " + bounded(e.getMessage());
+            result = new Reply(requestId, "error", "VALIDATION_ERROR", "Image Validation Error: "
+                    + (e instanceof java.nio.file.InvalidPathException ? "Invalid path." : bounded(e.getMessage())), List.of());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            result = "Image Processing Error: interrupted.";
+            result = new Reply(requestId, "error", "INTERRUPTED", "Image Processing Error: interrupted.", List.of());
+        } catch (Failure e) {
+            result = new Reply(requestId, "error", e.code, "Image Processing Error: " + e.getMessage(), List.of());
         } catch (IOException | RuntimeException e) {
-            result = "Image Processing Error: " + bounded(e.getMessage());
+            LOG.log(System.Logger.Level.DEBUG, "Image request " + requestId + " failed", e);
+            result = new Reply(requestId, "error", "IO_ERROR", "Image Processing Error: cannot read, process or publish image batch.", List.of());
         } finally {
             try {
                 cleanup(runtime);
             } catch (IOException e) {
-                result = "Image Cleanup Error: scratch could not be completely removed.";
+                result = new Reply(requestId, "error", "CLEANUP_FAILED",
+                        "Image Cleanup Error: scratch could not be completely removed.", published);
             } finally {
                 if (acquired) CAPACITY.release();
             }
         }
-        return result;
+        return encode(result);
+    }
+
+    private static String encode(Reply reply) {
+        try { return JSON.writeValueAsString(reply); }
+        catch (JsonProcessingException e) { return "{\"status\":\"error\",\"code\":\"SERIALIZATION_ERROR\"}"; }
     }
 
     private static Path relative(String path) {
@@ -248,6 +310,7 @@ public class ImageProcessingTool implements UltimateTool {
     }
 
     private static long stage(Path source, Path target, long deadline, long remainingBytes) throws IOException {
+        var before = Files.readAttributes(source, java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
         try (InputStream input = Files.newInputStream(source, LinkOption.NOFOLLOW_LINKS);
              OutputStream output = Files.newOutputStream(target, java.nio.file.StandardOpenOption.CREATE_NEW)) {
             byte[] buffer = new byte[64 * 1024];
@@ -259,26 +322,42 @@ public class ImageProcessingTool implements UltimateTool {
                 if (total > Math.min(FILE_LIMIT, remainingBytes)) throw new IOException("Input grew beyond the file/batch limit while staging.");
                 output.write(buffer, 0, count);
             }
+            var after = Files.readAttributes(source, java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!after.isRegularFile() || !java.util.Objects.equals(before.fileKey(), after.fileKey())
+                    || before.size() != total || after.size() != total || !before.lastModifiedTime().equals(after.lastModifiedTime()))
+                throw new Failure("INPUT_CHANGED", "Input changed during staging; retry with a stable file.");
             return total;
         }
     }
 
     private static String inputCoder(Path path) throws IOException {
+        try (InputStream raw = Files.newInputStream(path)) {
+            byte[] header = raw.readNBytes(12);
+            if (header.length == 12 && new String(header, 0, 4, java.nio.charset.StandardCharsets.US_ASCII).equals("RIFF")
+                    && new String(header, 8, 4, java.nio.charset.StandardCharsets.US_ASCII).equals("WEBP")) return "WEBP";
+        }
         try (InputStream raw = Files.newInputStream(path);
              var input = new MemoryCacheImageInputStream(raw)) {
             var readers = ImageIO.getImageReaders(input);
-            if (!readers.hasNext()) throw new IOException("Input is not a supported JPEG/PNG image.");
+            if (!readers.hasNext()) throw new Failure("INVALID_IMAGE", "Input is not a supported JPEG/PNG/WebP image.");
             var reader = readers.next();
             try {
                 String format = reader.getFormatName().toUpperCase(Locale.ROOT);
-                if (!format.equals("PNG") && !format.equals("JPEG")) throw new IOException("Only JPEG/PNG inputs are supported.");
+                if (!format.equals("PNG") && !format.equals("JPEG")) throw new Failure("INVALID_IMAGE", "Only JPEG/PNG/WebP inputs are supported.");
                 reader.setInput(input, true, true);
                 int width = reader.getWidth(0), height = reader.getHeight(0);
-                if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || (long) width * height > 40_000_000)
-                    throw new IOException("Input dimensions exceed image limits.");
+                checkDimensions(width, height);
                 return format;
             } finally { reader.dispose(); }
+        } catch (Failure e) { throw e; }
+        catch (IOException | RuntimeException e) {
+            throw new Failure("INVALID_IMAGE", "Invalid image header.");
         }
+    }
+
+    private static void checkDimensions(int width, int height) throws Failure {
+        if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || (long) width * height > 40_000_000)
+            throw new Failure("IMAGE_LIMIT", "Image dimensions exceed image limits.");
     }
 
     private List<String> command() {
@@ -289,14 +368,17 @@ public class ImageProcessingTool implements UltimateTool {
     private String execute(List<String> command, Path runtime, Map<String, String> environment, long deadline)
             throws IOException, InterruptedException {
         ImageProcessRunner.Result result = runner.run(command, runtime, environment, remaining(deadline));
-        if (result.timedOut()) throw new IOException("Batch exceeded its runtime limit.");
-        if (result.exitCode() != 0) throw new IOException("ImageMagick exited " + result.exitCode() + ": " + result.output());
+        if (result.timedOut()) throw new Failure("TIMEOUT", "Batch exceeded its runtime limit.");
+        if (result.exitCode() != 0) {
+            LOG.log(System.Logger.Level.DEBUG, "ImageMagick exited {0}: {1}", result.exitCode(), bounded(result.output()));
+            throw new Failure("NATIVE_ERROR", "ImageMagick could not process the image.");
+        }
         return result.output();
     }
 
     private static Duration remaining(long deadline) throws IOException {
         long nanos = deadline - System.nanoTime();
-        if (nanos <= 0) throw new IOException("Batch exceeded its runtime limit.");
+        if (nanos <= 0) throw new Failure("TIMEOUT", "Batch exceeded its runtime limit.");
         return Duration.ofNanos(nanos);
     }
 

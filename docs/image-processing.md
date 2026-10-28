@@ -37,7 +37,7 @@ The public `processImages` arguments, in order:
 | Argument | Meaning |
 | --- | --- |
 | `workspacePath` | Authorized absolute workspace directory |
-| `inputPaths` | List of 1–10 JPEG/PNG files, e.g. `["uploads/photo.png", "uploads/cover.jpeg"]` |
+| `inputPaths` | List of 1–10 JPEG/PNG/WebP files, e.g. `["uploads/photo.png", "uploads/cover.jpeg"]`; frame zero only |
 | `outputDirectory` | Existing relative parent, e.g. `results` |
 | `outputName` | New folder, e.g. `web-covers`; letters/numbers/underscore/hyphen, max 64 |
 | `operation` | `convert`, `resize`, `crop`, or `color-correct` |
@@ -61,7 +61,12 @@ This produces `results/web-covers/image-01.webp` and `image-02.webp`.
 `resize` preserves aspect ratio, fits inside the requested box and does not
 upscale. `crop` uses exact pixel coordinates **after EXIF orientation** and
 rejects rectangles outside the oriented image. Brightness/contrast correction
-uses sRGB. Every operation strips embedded profiles/metadata; final filenames
+uses sRGB. Embedded ICC profiles are transformed to a private standard sRGB
+profile before stripping. Untagged inputs use ImageMagick's declared colorspace;
+this does not infer a missing camera profile. PNG/WebP preserve alpha; JPEG
+flattens transparency onto white. WebP quality 100 uses lossless encoding
+(RGB values hidden by completely transparent pixels are not guaranteed).
+Every operation strips embedded profiles/metadata; final filenames
 are generated rather than taken from ImageMagick expressions.
 
 A watermark can be applied with any operation. It is rendered to a private PNG
@@ -72,11 +77,16 @@ the host; a text mark that cannot fit at the minimum size returns an error.
 ## Execution, cleanup and limits
 
 Inputs are copied into a unique `.ultimate-image-*` directory in that workspace.
-Only JPEG/PNG inputs are accepted, even if another file uses an image extension.
+Only JPEG/PNG/WebP inputs are accepted, regardless of filename extension.
+The first frame is processed; this tool does not preserve animations or all
+frames of a multi-image file.
 Native processing uses a fixed argument vector, no shell, a per-call policy
-allowing only PNG/JPEG/WebP/INFO coders, and disabled delegates/filters/indirect
+allowing PNG/JPEG/WebP/INFO coders and read-only ICC/ICM profiles, and disabled delegates/filters/indirect
 `@file` reads. These are defense-in-depth restrictions, not a claim of complete
-native-code sandboxing.
+native-code sandboxing. The child environment retains only host PATH and Windows
+OS lookup variables; HOME, locale, ImageMagick configuration and temporary paths
+are explicitly set. Inherited loader, credential and ImageMagick variables are
+not passed through. The configured binary and host PATH must be administrator-controlled.
 
 - Input: 25 MiB per file, 100 MiB per batch, maximum dimension 8192, maximum
   40 million pixels. Limits are checked again while staging growing files.
@@ -87,12 +97,48 @@ native-code sandboxing.
 
 All images must finish before the result directory is moved to the designated
 output target. A failed image does not publish earlier images from that batch.
-Input files are preserved. Native failure, timeout, invalid image, interruption
+Input files are preserved. Paths are checked again around staging; file identity,
+size and modification time must remain stable across each copy. Native failure, timeout, invalid image, interruption
 and publication failure all run scratch cleanup in `finally`. Only the final
 batch directory survives success. Cleanup failures return an explicit error;
-the tool does not falsely report successful cleanup. Results/errors are strings
-and do not throw to the model. Run blocking tool callbacks on the host's worker
+the tool does not falsely report successful cleanup. Observed child processes are
+terminated on timeout, interruption and normal parent exit. Descendants are
+sampled every 25ms; this cannot contain a deliberately detached process that
+escapes observation. OS process/job isolation remains a deployment responsibility.
+
+Canonical checks are not a race-free filesystem capability: another process with
+write access to workspace ancestors can race checks and opens. Provision exclusive
+tenant directory permissions and authorize both workspace and output destination.
+The tool does not establish caller identity or infer ownership from a path. A host
+crash, JVM forced kill or power loss prevents `finally` cleanup; the deployment
+must reclaim abandoned `.ultimate-image-*` directories after ensuring their jobs
+are dead. Do not delete a directory belonging to a live job. No such crash janitor
+or cross-host lifecycle/authorization service is supplied by this tool.
+
+Results/errors are JSON-encoded Java strings and do not throw from `processImages`.
+Run blocking tool callbacks on the host's worker
 execution path, not a reactive event-loop thread.
+
+## Result contract
+
+Every invocation receives a generated `requestId`. Inspect `status` and `code`,
+not message text. Successful artifacts have workspace-relative forward-slash
+paths, decoded format/dimensions and actual byte size. Native decoding verifies
+each output's format and expected dimensions **before** the batch is published.
+
+```json
+{"requestId":"47e04f04-ea49-44d6-afb4-26f47d04345a","status":"ok","code":"OK","message":"Image processing completed.","artifacts":[{"path":"web-covers/image-01.webp","format":"webp","width":128,"height":96,"bytes":1234}]}
+```
+
+The example byte count is illustrative. Stable error codes are `VALIDATION_ERROR`,
+`BUSY`, `INVALID_IMAGE`, `IMAGE_LIMIT`, `INPUT_CHANGED`, `TIMEOUT`, `NATIVE_ERROR`,
+`OUTPUT_INVALID`, `INTERRUPTED`, `IO_ERROR` and `CLEANUP_FAILED`. Native diagnostics
+and absolute private paths are not returned to the model; debug logs are host-only.
+Error artifacts are empty unless publication already succeeded and subsequent
+scratch cleanup failed (`CLEANUP_FAILED`); in that case the published artifacts
+are retained in the result. The framework's default String result converter may
+wrap this JSON in a JSON string. Invalid tool-call JSON/type binding is handled
+by Spring AI before method invocation; this contract describes method results.
 
 ## Verification
 
@@ -108,8 +154,44 @@ image contract/process tests still run. The dedicated image workflow supplies
 the native executable on Linux. The symlink test skips on hosts that prohibit
 symlink creation; it runs on a normal Linux filesystem.
 
-Tests exercise real JPEG/PNG → WebP output, exact crop and resize dimensions,
-color changes, literal watermark pixels, synthetic EXIF orientation and removal,
-comment stripping, ten-input batches, concurrent calls, partial-batch failure,
-traversal, byte limits, overwrite races, cleanup, and real process stream/timeout
-behavior. No paid service, production credential, user upload or model is needed.
+### Reference corpus and acceptance matrix
+
+Fixtures are generated locally by the tests (no downloaded user images).
+
+| Area | Objective assertion |
+| --- | --- |
+| PNG/JPEG/WebP | All nine input/output pairs: native format, dimensions, opaque reference channels within ±4 and unchanged input bytes; PNG→lossless WebP→PNG alpha and opaque/partial-alpha pixels |
+| JPEG alpha | Fully transparent area becomes white (250–255 per channel); opaque reference channels stay within ±3 |
+| Color | RGB crop/color-adjustment pixels; grayscale equal channels; untagged CMYK→RGB within ±10; embedded linear RGB 128 transforms to sRGB 185–191 before ICC removal |
+| Orientation | All eight EXIF orientations: exact corner mapping and width/height; oriented crop; removed EXIF/comment profiles |
+| Malformed/unsupported | Truncated PNG, invalid WebP, unsupported SVG; no partial publication and unchanged source bytes |
+| Bounds/publication | 12MP resize, ten-image batch, two concurrent calls, third-call BUSY and capacity recovery, traversal/symlinks, byte/pixel limits, output corruption and concurrent destination creation |
+| Process | Bounded real stdout/stderr, real timeout/interruption, observed descendant cleanup, inherited environment filtering |
+| AI tool boundary | Production Spring AI MethodToolCallbackProvider schema binding → validation → native execution → publication → JSON result; artifact bytes agree with direct invocation; conflicting parameters return a stable error |
+
+These are deterministic generated-reference tests, not an exhaustive photographic
+color corpus or a security certification. The callback test does not run an LLM,
+Ollama, the chat UI, an authenticated tenant session or the complete application
+intent/planning loop. Deployment reviewers must validate those integration layers
+using their selected model and authorization configuration.
+
+### Resource observations
+
+Opt in with `-Dultimate.image.benchmark=true` alongside the native executable
+property. `ImageProcessingBenchmarkTest` writes
+`target/image-processing-benchmark.json`; the image workflow uploads it with
+Surefire reports. It records fixture SHA-256s, OS/Java/ImageMagick/CPU-count/heap,
+native startup, first image call, 12MP resize, ten-image batch, two concurrent
+calls, twelve repeated calls, and an injected slow child timeout followed by
+successful recovery. Each case reports elapsed time, sampled process CPU,
+workspace logical storage peak, and Linux `/proc` aggregate JVM+descendant RSS
+and block I/O counters. Unsupported RSS/I/O observations are `null` on Windows.
+
+Sampling at 50ms can miss short-lived processes and instantaneous peaks; storage
+includes fixture and retained output bytes, and CPU/RSS include the test JVM and
+sampler. Cached reads may have zero block I/O. These values are observations,
+not exact peak measurements. First-call timing is not a flushed OS cold-cache
+benchmark. Repetition is a short smoke workload, not a long soak or controlled
+memory-pressure run. Whole-AI-workload behavior, production hardware, model
+concurrency and pass/fail resource thresholds must be defined and measured by
+the deployment reviewer; this report does not establish them.

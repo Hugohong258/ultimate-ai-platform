@@ -78,6 +78,7 @@ class ImageProcessingToolTest {
         var commands = new ArrayList<List<String>>();
         var tool = tool((command, directory, env, timeout) -> {
             commands.add(List.copyOf(command));
+            if (command.contains("%m %w %h")) return new ImageProcessRunner.Result(0, false, "PNG 128 96");
             if (command.contains("info:")) return new ImageProcessRunner.Result(0, false, "128 96");
             if (commands.size() == 2) {
                 Path output = Path.of(command.getLast().substring("PNG:".length()));
@@ -86,11 +87,11 @@ class ImageProcessingToolTest {
             }
             return new ImageProcessRunner.Result(1, false, "second image failed");
         });
-        assertThat(convert(tool, workspace, List.of("input.png", "second.png"), ".", "out")).contains("second image failed");
+        assertThat(convert(tool, workspace, List.of("input.png", "second.png"), ".", "out")).contains("NATIVE_ERROR");
         assertThat(workspace.resolve("out")).doesNotExist();
         assertThat(workspace.resolve("input.png")).exists();
         noScratch(workspace);
-        assertThat(commands).hasSize(4);
+        assertThat(commands).hasSize(5);
     }
 
     @Test void cleansScratchOnTimeoutAndInterruption() throws Exception {
@@ -111,7 +112,7 @@ class ImageProcessingToolTest {
         Files.writeString(workspace.resolve("fake.png"), "not an image");
         var tool = tool((c, p, e, t) -> new ImageProcessRunner.Result(0, false, c.contains("info:") ? "128 96" : ""));
         assertThat(convert(tool, workspace, List.of("fake.png"), ".", "out")).contains("supported JPEG/PNG");
-        assertThat(convert(tool, workspace, List.of("input.png"), ".", "out")).contains("nonempty image");
+        assertThat(convert(tool, workspace, List.of("input.png"), ".", "out")).contains("IO_ERROR");
         assertThat(workspace.resolve("out")).doesNotExist();
         noScratch(workspace);
     }
@@ -161,6 +162,7 @@ class ImageProcessingToolTest {
     @Test void doesNotReplaceAnOutputCreatedDuringProcessing() throws Exception {
         Path workspace = workspace();
         var tool = tool((command, directory, env, timeout) -> {
+            if (command.contains("%m %w %h")) return new ImageProcessRunner.Result(0, false, "PNG 128 96");
             if (command.contains("info:")) return new ImageProcessRunner.Result(0, false, "128 96");
             Files.copy(directory.resolve("input-0.image"), Path.of(command.getLast().substring("PNG:".length())));
             Files.createDirectory(workspace.resolve("out"));
@@ -170,6 +172,92 @@ class ImageProcessingToolTest {
         assertThat(convert(tool, workspace, List.of("input.png"), ".", "out")).contains("Image Processing Error");
         assertThat(workspace.resolve("out/keep.txt")).hasContent("concurrent output");
         assertThat(workspace.resolve("out/image-01.png")).doesNotExist();
+        noScratch(workspace);
+    }
+
+    @Test void rejectsAChangedOrCorruptOutputBeforePublication() throws Exception {
+        Path workspace = workspace();
+        var tool = tool((command, directory, env, timeout) -> {
+            if (command.contains("%m %w %h")) return new ImageProcessRunner.Result(0, false, "PNG 1 1");
+            if (command.contains("info:")) return new ImageProcessRunner.Result(0, false, "128 96");
+            Files.copy(directory.resolve("input-0.image"), Path.of(command.getLast().substring("PNG:".length())));
+            return new ImageProcessRunner.Result(0, false, "");
+        });
+        assertThat(convert(tool, workspace, List.of("input.png"), ".", "out")).contains("OUTPUT_INVALID");
+        assertThat(workspace.resolve("out")).doesNotExist();
+        noScratch(workspace);
+    }
+
+    @Test void boundsConcurrentWorkAndRecoversCapacityAfterNativeFailures() throws Exception {
+        Path workspace = workspace();
+        var entered = new java.util.concurrent.CountDownLatch(2);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var tool = tool((command, directory, env, timeout) -> {
+            entered.countDown();
+            if (!release.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("workers stuck");
+            return new ImageProcessRunner.Result(1, false, "private native diagnostic " + directory);
+        });
+        try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var first = executor.submit(() -> convert(tool, workspace, List.of("input.png"), ".", "first"));
+            var second = executor.submit(() -> convert(tool, workspace, List.of("input.png"), ".", "second"));
+            try {
+                assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(convert(tool, workspace, List.of("input.png"), ".", "third")).contains("BUSY");
+            } finally { release.countDown(); }
+            assertThat(first.get()).contains("NATIVE_ERROR").doesNotContain("private native diagnostic", workspace.toString());
+            assertThat(second.get()).contains("NATIVE_ERROR");
+        }
+        assertThat(convert(tool, workspace, List.of("input.png"), ".", "recovered")).contains("NATIVE_ERROR").doesNotContain("BUSY");
+        noScratch(workspace);
+    }
+
+    @Test void rejectsRelativeWorkspacesAndConflictingParametersBeforeExecution() throws Exception {
+        Path workspace = workspace();
+        var tool = tool((c, p, e, t) -> { throw new AssertionError("must not execute"); });
+        assertThat(convert(tool, Path.of("relative"), List.of("input.png"), ".", "out")).contains("VALIDATION_ERROR");
+        for (String operation : List.of("convert", "resize", "crop", "color-correct", "unknown")) {
+            assertThat(tool.processImages(workspace.toString(), List.of("input.png"), ".", "out", operation,
+                    "svg", 0, 0, 0, 0, 85, 0, 0, "")).contains("VALIDATION_ERROR");
+        }
+        assertThat(tool.processImages(workspace.toString(), List.of("input.png"), ".", "out", "convert",
+                "png", 1, 0, 0, 0, 85, 0, 0, "")).contains("VALIDATION_ERROR");
+    }
+
+    @Test void rejectsHugeHeaderDimensionsAndPixelCountsWithoutDecodingTheRaster() throws Exception {
+        Path workspace = workspace();
+        var tool = tool((c, p, e, t) -> { throw new AssertionError("must not execute"); });
+        for (int[] dimensions : List.of(new int[]{8193, 1}, new int[]{8192, 8192})) {
+            byte[] bytes = Files.readAllBytes(workspace.resolve("input.png"));
+            var buffer = java.nio.ByteBuffer.wrap(bytes);
+            buffer.putInt(16, dimensions[0]).putInt(20, dimensions[1]);
+            var crc = new java.util.zip.CRC32();
+            crc.update(bytes, 12, 17);
+            buffer.putInt(29, (int) crc.getValue());
+            Files.write(workspace.resolve("huge.png"), bytes);
+            assertThat(convert(tool, workspace, List.of("huge.png"), ".", "out")).contains("IMAGE_LIMIT");
+            noScratch(workspace);
+        }
+    }
+
+    @Test void rejectsOutputParentReplacedWithSymlinkDuringProcessing() throws Exception {
+        Path workspace = workspace();
+        Path outside = Files.createDirectories(temporary.resolve("managed/tenant-b"));
+        Path link = workspace.resolve("link-test");
+        try { Files.createSymbolicLink(link, outside); Files.delete(link); }
+        catch (java.io.IOException | UnsupportedOperationException e) { assumeTrue(false, "Host does not permit symlinks"); }
+        Files.createDirectory(workspace.resolve("results"));
+        Files.writeString(outside.resolve("keep.txt"), "other tenant");
+        var tool = tool((command, directory, env, timeout) -> {
+            if (command.contains("%m %w %h")) return new ImageProcessRunner.Result(0, false, "PNG 128 96");
+            if (command.contains("info:")) return new ImageProcessRunner.Result(0, false, "128 96");
+            Files.copy(directory.resolve("input-0.image"), Path.of(command.getLast().substring("PNG:".length())));
+            Files.move(workspace.resolve("results"), workspace.resolve("old-results"));
+            Files.createSymbolicLink(workspace.resolve("results"), outside);
+            return new ImageProcessRunner.Result(0, false, "");
+        });
+        assertThat(convert(tool, workspace, List.of("input.png"), "results", "out")).contains("VALIDATION_ERROR");
+        assertThat(outside.resolve("keep.txt")).hasContent("other tenant");
+        assertThat(outside.resolve("out")).doesNotExist();
         noScratch(workspace);
     }
 }

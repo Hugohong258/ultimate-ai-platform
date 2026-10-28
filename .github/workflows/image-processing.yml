@@ -43,11 +43,13 @@ jobs:
         run: |
           chmod +x mvnw
           printf '%s\n' '<settings><mirrors><mirror><id>central-native-tests</id><mirrorOf>*</mirrorOf><url>https://repo.maven.apache.org/maven2</url></mirror></mirrors></settings>' > "$RUNNER_TEMP/image-maven-settings.xml"
-          ./mvnw -B -ntp -s "$RUNNER_TEMP/image-maven-settings.xml" -Dultimate.image.integration.binary="$IMAGE_MAGICK" clean verify
+          ./mvnw -B -ntp -s "$RUNNER_TEMP/image-maven-settings.xml" -Dultimate.image.integration.binary="$IMAGE_MAGICK" -Dultimate.image.benchmark=true clean verify
       - name: Upload test evidence
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: native-image-test-results
-          path: server/target/surefire-reports/
+          path: |
+            server/target/surefire-reports/
+            server/target/image-processing-benchmark.json
           if-no-files-found: warn
