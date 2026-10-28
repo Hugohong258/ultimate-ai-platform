@@ -85,6 +85,7 @@ public class ImageProcessingTool implements UltimateTool {
         this.budget = budget;
     }
 
+    /** Validates a managed batch and returns correlated JSON only after verifying all output artifacts. */
     @Tool(description = "Process 1-10 local JPEG/PNG/WebP images in an authorized managed workspace. "
             + "Convert to png/jpeg/webp, resize to fit a width/height box without upscaling, "
             + "crop after EXIF orientation using pixel offsets, or color-correct brightness/contrast. "
@@ -129,9 +130,14 @@ public class ImageProcessingTool implements UltimateTool {
             if (workspacePath == null || !Path.of(workspacePath).isAbsolute())
                 throw new IllegalArgumentException("Workspace path must be absolute.");
             Path workspace = Path.of(workspacePath).toAbsolutePath().normalize();
-            if (workspace.equals(root) || !workspace.startsWith(root))
+            Path belowRoot;
+            if (workspace.startsWith(managedRoot)) belowRoot = managedRoot.relativize(workspace);
+            else if (workspace.startsWith(root)) belowRoot = root.relativize(workspace);
+            else throw new IllegalArgumentException("Workspace must be below the managed root.");
+            if (belowRoot.toString().isEmpty())
                 throw new IllegalArgumentException("Workspace must be below the managed root.");
-            workspace = contained(root, workspace, true);
+            // Resolve the trusted configured alias once; reject symlinks in the untrusted remainder.
+            workspace = contained(root, belowRoot, true);
             Path outputParent = contained(workspace, relative(outputDirectory), true);
             Path target = outputParent.resolve(outputName);
             if (Files.exists(target, LinkOption.NOFOLLOW_LINKS))
@@ -272,6 +278,7 @@ public class ImageProcessingTool implements UltimateTool {
         return value;
     }
 
+    /** Resolves a path below a canonical trusted boundary, rejecting every symlink in its relative suffix. */
     private static Path contained(Path boundary, Path path, boolean directory) throws IOException {
         Path candidate = boundary.resolve(path).toAbsolutePath().normalize();
         if (!candidate.startsWith(boundary)) throw new IllegalArgumentException("Path escapes workspace.");
@@ -309,6 +316,7 @@ public class ImageProcessingTool implements UltimateTool {
             throw new IllegalArgumentException("Watermark must contain at most 80 printable characters.");
     }
 
+    /** Copies a bounded snapshot and rejects source identity/size/mtime changes; host ACLs still prevent ancestor races. */
     private static long stage(Path source, Path target, long deadline, long remainingBytes) throws IOException {
         var before = Files.readAttributes(source, java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
         try (InputStream input = Files.newInputStream(source, LinkOption.NOFOLLOW_LINKS);
@@ -330,6 +338,7 @@ public class ImageProcessingTool implements UltimateTool {
         }
     }
 
+    /** Checks the raster allowlist and cheap header bounds before native decoding; WebP is validated by the native probe. */
     private static String inputCoder(Path path) throws IOException {
         try (InputStream raw = Files.newInputStream(path)) {
             byte[] header = raw.readNBytes(12);
@@ -387,6 +396,7 @@ public class ImageProcessingTool implements UltimateTool {
         return message.substring(0, Math.min(message.length(), 1200));
     }
 
+    /** Renders literal text to a bounded RGBA overlay; no text is interpreted as native options or expressions. */
     private static void watermark(Path target, String text, int width, int height) throws IOException {
         var canvas = new BufferedImage(Math.min(width, 1600), Math.min(height, 120), BufferedImage.TYPE_INT_ARGB);
         var graphics = canvas.createGraphics();
@@ -398,7 +408,7 @@ public class ImageProcessingTool implements UltimateTool {
                 if (graphics.getFontMetrics().stringWidth(text) + 8 <= canvas.getWidth()
                         && graphics.getFontMetrics().getHeight() + 8 <= canvas.getHeight()) break;
             }
-            if (size < 8) throw new IOException("Watermark does not fit the output image.");
+            if (size < 8) throw new Failure("WATERMARK_TOO_LARGE", "Watermark does not fit the output image.");
             int textWidth = graphics.getFontMetrics().stringWidth(text) + 8;
             int textHeight = graphics.getFontMetrics().getHeight() + 8;
             int left = canvas.getWidth() - textWidth, top = canvas.getHeight() - textHeight;

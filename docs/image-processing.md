@@ -27,6 +27,9 @@ For example:
 
 `inputPaths` and `outputDirectory` are relative to the selected workspace;
 absolute input/output paths, escaping paths and symbolic links are rejected.
+The workspace may use either the configured managed-root spelling or its
+canonical spelling when trusted ancestors of that root are symlinked (for
+example `/var` on macOS). Symlinks **below** the managed root remain rejected.
 The output parent must exist. `outputName` names a **new batch folder** in that
 parent. Existing folders and files are never replaced.
 
@@ -132,7 +135,9 @@ each output's format and expected dimensions **before** the batch is published.
 
 The example byte count is illustrative. Stable error codes are `VALIDATION_ERROR`,
 `BUSY`, `INVALID_IMAGE`, `IMAGE_LIMIT`, `INPUT_CHANGED`, `TIMEOUT`, `NATIVE_ERROR`,
-`OUTPUT_INVALID`, `INTERRUPTED`, `IO_ERROR` and `CLEANUP_FAILED`. Native diagnostics
+`OUTPUT_INVALID`, `INTERRUPTED`, `IO_ERROR`, `CLEANUP_FAILED` and
+`WATERMARK_TOO_LARGE`. The latter means the literal mark cannot fit even at the
+minimum font size; shorten the text or enlarge the output. Native diagnostics
 and absolute private paths are not returned to the model; debug logs are host-only.
 Error artifacts are empty unless publication already succeeded and subsequent
 scratch cleanup failed (`CLEANUP_FAILED`); in that case the published artifacts
@@ -180,12 +185,17 @@ using their selected model and authorization configuration.
 Opt in with `-Dultimate.image.benchmark=true` alongside the native executable
 property. `ImageProcessingBenchmarkTest` writes
 `target/image-processing-benchmark.json`; the image workflow uploads it with
-Surefire reports. It records fixture SHA-256s, OS/Java/ImageMagick/CPU-count/heap,
+Surefire reports. It records fixture SHA-256s, input dimensions/byte sizes,
+OS/Java/ImageMagick/CPU-count/system-memory/heap,
 native startup, first image call, 12MP resize, ten-image batch, two concurrent
 calls, twelve repeated calls, and an injected slow child timeout followed by
 successful recovery. Each case reports elapsed time, sampled process CPU,
 workspace logical storage peak, and Linux `/proc` aggregate JVM+descendant RSS
 and block I/O counters. Unsupported RSS/I/O observations are `null` on Windows.
+Each case identifies its operation, output format/quality, successful image
+count/throughput, attempts and concurrency. Sampled CPU percent is relative to
+one logical core (so aggregate values may exceed 100%). Model inference is
+explicitly inactive and GPU acceleration is not requested.
 
 Sampling at 50ms can miss short-lived processes and instantaneous peaks; storage
 includes fixture and retained output bytes, and CPU/RSS include the test JVM and
@@ -195,3 +205,33 @@ benchmark. Repetition is a short smoke workload, not a long soak or controlled
 memory-pressure run. Whole-AI-workload behavior, production hardware, model
 concurrency and pass/fail resource thresholds must be defined and measured by
 the deployment reviewer; this report does not establish them.
+
+### Observed environments and deployment review
+
+The Windows development measurements used Windows11, Intel Core i7-14650HX
+(16 cores / 24 logical processors), 16GB nominal RAM (16,873,545,728 usable bytes),
+a 1.024TB SSD (workspace on a 322GB partition), Java21.0.12.1 and the portable
+ImageMagick7.1.2-34 Q16 build. An RTX4060 Laptop GPU is present; its VRAM capacity
+and application-level inference compatibility were **not** tested. The image
+workloads used CPU processing without a running model. These observations do
+not certify the combined 16GB RAM / RTX4050-class 8GB VRAM / 1TB SSD reference
+deployment. Physical disk capacity is not a guarantee of sufficient free space
+for model storage.
+
+The Linux verification uses an ephemeral GitHub-hosted Ubuntu runner, four
+logical CPUs, Java21 and the pinned Q16-HDRI AppImage. The generated report records
+that run's actual OS, Java, available system RAM and native version. It is a CPU
+CI environment, not the proposed GPU reference workstation. macOS itself has
+not been run; Linux exercises a symlinked-ancestor regression matching the path
+alias condition. Windows skips symlink cases if its permissions prohibit them.
+
+For a running deployment, authorize the selected workspace/output before
+exposing the callback, carry the authenticated user/session/job identity at the
+host layer, provision exclusive directory permissions and OS process isolation,
+and reclaim only confirmed-dead jobs after forced termination. Those host
+services are not implemented by this image module. The automated callback test
+uses the real Spring binding and native execution, not a mocked image processor;
+it does not validate a live model-generated intent or authenticated UI session.
+Sustained memory pressure, crash recovery, simultaneous model inference and
+deployment-specific latency/RSS/storage budgets remain unverified acceptance
+items. No such result is implied by the finite corpus or short benchmark.

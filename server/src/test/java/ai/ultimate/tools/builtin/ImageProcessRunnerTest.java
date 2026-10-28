@@ -90,14 +90,19 @@ class ImageProcessRunnerTest {
                 var child = new java.util.ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", executable).toString(),
                         "-cp", System.getProperty("java.class.path"), Probe.class.getName(), "pid-sleep"));
                 child.add(args[1]);
+                child.add("1200"); // exercise a child that cannot publish readiness within the old 800ms delay
                 new ProcessBuilder(child).redirectOutput(ProcessBuilder.Redirect.DISCARD)
                         .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+                long readyDeadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+                while (!Files.exists(Path.of(args[1])) && System.nanoTime() < readyDeadline) Thread.sleep(10);
+                if (!Files.exists(Path.of(args[1]))) throw new java.io.IOException("Child did not publish its PID");
                 System.out.println("child-started");
                 Thread.sleep(args[0].equals("parent-exits") ? 800 : 15_000);
                 System.out.println("parent-returning");
                 return;
             }
             if (args[0].equals("pid-sleep")) {
+                if (args.length > 2) Thread.sleep(Long.parseLong(args[2]));
                 Files.writeString(Path.of(args[1]), Long.toString(ProcessHandle.current().pid()));
                 Thread.sleep(15_000);
                 return;

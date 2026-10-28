@@ -21,6 +21,7 @@ interface ImageProcessRunner {
     record Result(int exitCode, boolean timedOut, String output) { }
 
     final class Native implements ImageProcessRunner {
+        /** Runs controlled argv with bounded output capture and cleanup of the process descendants actually observed. */
         @Override
         public Result run(List<String> command, Path directory, Map<String, String> environment,
                           Duration timeout) throws IOException, InterruptedException {
@@ -78,6 +79,7 @@ interface ImageProcessRunner {
             }
         }
 
+        /** Retains trusted OS/executable lookup only, supplying private scratch/configuration and deterministic locale. */
         static Map<String, String> environment(Map<String, String> inherited, Path directory,
                                                Map<String, String> overrides) {
             Map<String, String> clean = new HashMap<>();

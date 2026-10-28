@@ -38,7 +38,13 @@ class ImageProcessingBenchmarkTest {
         report.put("environment", Map.of("os", System.getProperty("os.name"), "osVersion", System.getProperty("os.version"),
                 "architecture", System.getProperty("os.arch"), "java", System.getProperty("java.version"),
                 "logicalProcessors", Runtime.getRuntime().availableProcessors(), "maxJvmHeapBytes", Runtime.getRuntime().maxMemory(),
+                "systemMemoryBytes", ((com.sun.management.OperatingSystemMXBean) java.lang.management.ManagementFactory.getOperatingSystemMXBean()).getTotalMemorySize(),
                 "imageMagick", nativeRunner.run(List.of(binary, "-version"), workspace, Map.of(), Duration.ofSeconds(5)).output()));
+        report.put("modelInferenceActive", false);
+        report.put("gpuAccelerationRequested", false);
+        report.put("inputs", List.of(Map.of("name", "small.png", "width", 640, "height", 480,
+                        "bytes", Files.size(workspace.resolve("small.png"))),
+                Map.of("name", "large.png", "width", 4000, "height", 3000, "bytes", Files.size(workspace.resolve("large.png")))));
         report.put("method", "50ms JVM+observed-descendant sampling; RSS only on Linux /proc; CPU counters may miss exited processes; "
                 + "workspace peak is logical bytes including fixtures and published files. First call is not an OS cold-cache run. No LLM load.");
         report.put("corpusSha256", Map.of("small.png", sha256(workspace.resolve("small.png")), "large.png", sha256(workspace.resolve("large.png"))));
@@ -120,11 +126,23 @@ class ImageProcessingBenchmarkTest {
             values.put("name", name);
             values.put("elapsedMs", elapsed / 1_000_000.0);
             values.put("sampleCount", sampler.samples);
-            values.put("sampledCpuMs", sampler.cpu.values().stream().mapToLong(Long::longValue).sum() / 1_000_000.0);
+            double cpuMs = sampler.cpu.values().stream().mapToLong(Long::longValue).sum() / 1_000_000.0;
+            values.put("sampledCpuMs", cpuMs);
+            values.put("sampledCpuPercentOfOneCore", cpuMs * 100 / (elapsed / 1_000_000.0));
             values.put("sampledPeakRssBytes", sampler.linux ? sampler.peakRss : null);
             values.put("sampledReadBytes", sampler.linux ? sampler.read.values().stream().mapToLong(Long::longValue).sum() : null);
             values.put("sampledWriteBytes", sampler.linux ? sampler.write.values().stream().mapToLong(Long::longValue).sum() : null);
             values.put("sampledPeakWorkspaceBytes", sampler.peakDisk);
+            boolean startup = name.equals("native-process-startup"), large = name.equals("large-12MP-resize");
+            int images = startup ? 0 : name.equals("ten-image-batch") ? 10 : name.equals("two-concurrent-calls") ? 2 : 1;
+            values.put("input", startup ? null : large ? "large.png" : "small.png");
+            values.put("operation", startup ? "version" : large ? "resize-to-2000x1500" : "convert");
+            values.put("outputFormat", startup ? null : "webp");
+            values.put("quality", startup ? null : 85);
+            values.put("successfulImages", images);
+            values.put("concurrentCalls", name.equals("two-concurrent-calls") ? 2 : 1);
+            values.put("attempts", name.equals("timeout-and-recovery") ? 2 : name.equals("two-concurrent-calls") ? 2 : 1);
+            values.put("successfulImagesPerSecond", startup ? null : images * 1_000_000_000.0 / elapsed);
             cases.add(values);
         }
     }

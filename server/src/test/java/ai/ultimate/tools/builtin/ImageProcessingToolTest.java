@@ -260,4 +260,43 @@ class ImageProcessingToolTest {
         assertThat(outside.resolve("out")).doesNotExist();
         noScratch(workspace);
     }
+
+    @Test void reportsAnOversizedWatermarkWithAnActionableCode() throws Exception {
+        Path workspace = workspace();
+        var tool = tool((command, directory, env, timeout) -> {
+            assertThat(command).contains("info:"); // failure must happen before the conversion command
+            return new ImageProcessRunner.Result(0, false, "128 96");
+        });
+        String reply = tool.processImages(workspace.toString(), List.of("input.png"), ".", "out", "crop",
+                "png", 16, 20, 0, 0, 85, 0, 0, "This watermark will not fit");
+        assertThat(reply).contains("WATERMARK_TOO_LARGE", "Watermark does not fit");
+        assertThat(workspace.resolve("out")).doesNotExist();
+        noScratch(workspace);
+    }
+
+    @Test void acceptsConfiguredAndCanonicalRootsWithSymlinkedAncestorsButRejectsLinksBelowRoot() throws Exception {
+        Path realParent = Files.createDirectory(temporary.resolve("physical"));
+        Path workspace = Files.createDirectories(realParent.resolve("managed/tenant-a"));
+        ImageIO.write(new BufferedImage(16, 16, BufferedImage.TYPE_INT_RGB), "png", workspace.resolve("input.png").toFile());
+        Path alias = temporary.resolve("alias");
+        try { Files.createSymbolicLink(alias, realParent); }
+        catch (java.io.IOException | UnsupportedOperationException e) { assumeTrue(false, "Host does not permit symlinks"); }
+        Path configuredRoot = alias.resolve("managed");
+        var executions = new java.util.concurrent.atomic.AtomicInteger();
+        var tool = new ImageProcessingTool(configuredRoot, "magick", (c, p, e, t) -> {
+            executions.incrementAndGet();
+            return new ImageProcessRunner.Result(1, false, "intentional native failure");
+        }, Duration.ofSeconds(10));
+        assertThat(convert(tool, configuredRoot.resolve("tenant-a"), List.of("input.png"), ".", "out")).contains("NATIVE_ERROR");
+        assertThat(convert(tool, workspace, List.of("input.png"), ".", "out")).contains("NATIVE_ERROR");
+        assertThat(executions.get()).isEqualTo(2);
+        Files.createSymbolicLink(realParent.resolve("managed/linked-tenant"), workspace);
+        assertThat(convert(tool, configuredRoot.resolve("linked-tenant"), List.of("input.png"), ".", "out"))
+                .contains("VALIDATION_ERROR", "Symbolic links");
+        assertThat(convert(tool, configuredRoot, List.of("input.png"), ".", "out")).contains("VALIDATION_ERROR");
+        assertThat(convert(tool, realParent.resolve("managed"), List.of("input.png"), ".", "out")).contains("VALIDATION_ERROR");
+        assertThat(convert(tool, alias.resolve("managed-sibling"), List.of("input.png"), ".", "out")).contains("VALIDATION_ERROR");
+        assertThat(executions.get()).isEqualTo(2);
+        noScratch(workspace);
+    }
 }
