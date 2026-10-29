@@ -4,6 +4,8 @@ import ai.ultimate.tools.UltimateTool;
 import ai.ultimate.tools.ToolRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.tool.method.MethodToolCallback;
+import org.springframework.ai.tool.support.ToolDefinitions;
 import org.springframework.data.r2dbc.core.R2dbcEntityTemplate;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
@@ -23,7 +25,7 @@ import java.util.UUID;
  * RESPONSIBILITIES:
  * 1. Build tool list from ToolRegistry
  * 2. Call AgentPlanner for each step
- * 3. Execute tools via reflection on @Tool methods
+ * 3. Execute @Tool methods with raw single-string or schema-bound structured input
  * 4. Persist each step to agent_steps table
  * 5. Emit AgentEvent for each step (SSE streaming)
  * 6. Enforce MAX_STEPS + TIMEOUT safety limits
@@ -330,7 +332,7 @@ public class AgentExecutor {
      * Agent loop continues even if one tool fails.
      *
      * @param toolName exact method name from AI response
-     * @param input    input string for the tool method
+     * @param input    raw text for a single String parameter, otherwise a JSON argument object
      * @return tool result as string, never null
      */
     private String executeTool(
@@ -366,8 +368,9 @@ public class AgentExecutor {
                                     toolName.trim());
 
                     if (matches) {
-                        Object result =
-                                method.invoke(tool, input);
+                        Object result = acceptsRawText(method)
+                                ? method.invoke(tool, input)
+                                : callback(tool, method).call(input);
 
                         long duration =
                                 System.currentTimeMillis()
@@ -413,7 +416,7 @@ public class AgentExecutor {
      * Build formatted tool list for planner system prompt.
      *
      * Scans all UltimateTool beans and collects @Tool
-     * method names + descriptions. New tools added via
+     * method names + descriptions and structured input schemas. New tools added via
      * @Component are automatically included.
      *
      * @return formatted "- methodName: description\n..."
@@ -433,14 +436,32 @@ public class AgentExecutor {
                                         .Tool.class);
 
                 if (ann != null) {
+                    String description = ann.description();
+                    if (!acceptsRawText(method)) {
+                        description += "\n  INPUT must be a JSON object matching this schema: "
+                                + callback(tool, method).getToolDefinition().inputSchema();
+                    }
                     tools.put(
                             method.getName(),
-                            ann.description());
+                            description);
                 }
             }
         }
 
         return planner.formatToolList(tools);
+    }
+
+    /** Preserve the agent's existing free-text contract for single-string tools. */
+    private static boolean acceptsRawText(Method method) {
+        return method.getParameterCount() == 1 && method.getParameterTypes()[0] == String.class;
+    }
+
+    /** Use Spring AI's production argument binding while preserving the tool's String result verbatim. */
+    private static MethodToolCallback callback(UltimateTool tool, Method method) {
+        return MethodToolCallback.builder().toolObject(tool).toolMethod(method)
+                .toolDefinition(ToolDefinitions.from(method))
+                .toolCallResultConverter((result, type) -> result != null ? result.toString() : "No result returned")
+                .build();
     }
 
     /**

@@ -6,6 +6,13 @@ It uses **ImageMagick 7** on the local host; no external image API or model is
 called. Put `magick` on the host's PATH, or set the trusted deployment JVM
 property `-Dultimate.tools.image.magick=/absolute/path/to/magick`.
 
+The ReACT `AgentExecutor` advertises the method's JSON input schema and binds
+the planner's `INPUT:` object through Spring AI's `MethodToolCallback`. Existing
+single-String tools keep their free-text input contract. Structured tool results
+reach `OBSERVE` as the original String (no extra JSON quoting). Invalid JSON
+binding returns the existing agent `Tool error:` response; image validation
+errors after successful binding retain the image JSON error contract.
+
 ## Workspace setup
 
 The invoking host must authorize the selected workspace for the caller **before
@@ -100,6 +107,12 @@ not passed through. The configured binary and host PATH must be administrator-co
 
 All images must finish before the result directory is moved to the designated
 output target. A failed image does not publish earlier images from that batch.
+Publication uses a same-workspace `Files.move` without `REPLACE_EXISTING`.
+The acceptance suite synchronizes two complete native batches immediately
+before publication, checks that only one wins, preserves its complete output,
+and verifies capacity recovery. This covers the tested local Windows/Linux
+filesystems; it does not establish portable atomic rename semantics for remote
+or custom filesystem providers. No `ATOMIC_MOVE` overwrite behavior is assumed.
 Input files are preserved. Paths are checked again around staging; file identity,
 size and modification time must remain stable across each copy. Native failure, timeout, invalid image, interruption
 and publication failure all run scratch cleanup in `finally`. Only the final
@@ -108,6 +121,10 @@ the tool does not falsely report successful cleanup. Observed child processes ar
 terminated on timeout, interruption and normal parent exit. Descendants are
 sampled every 25ms; this cannot contain a deliberately detached process that
 escapes observation. OS process/job isolation remains a deployment responsibility.
+The process regression checks both discarded and inherited child stdout/stderr,
+after timeout and normal parent exit, and requires the observed child to be
+dead when the runner returns. These finite cases do not prove containment of
+unobserved processes or arbitrary operating-system termination delays.
 
 Canonical checks are not a race-free filesystem capability: another process with
 write access to workspace ancestors can race checks and opens. Provision exclusive
@@ -172,7 +189,7 @@ Fixtures are generated locally by the tests (no downloaded user images).
 | Malformed/unsupported | Truncated PNG, invalid WebP, unsupported SVG; no partial publication and unchanged source bytes |
 | Bounds/publication | 12MP resize, ten-image batch, two concurrent calls, third-call BUSY and capacity recovery, traversal/symlinks, byte/pixel limits, output corruption and concurrent destination creation |
 | Process | Bounded real stdout/stderr, real timeout/interruption, observed descendant cleanup, inherited environment filtering |
-| AI tool boundary | Production Spring AI MethodToolCallbackProvider schema binding → validation → native execution → publication → JSON result; artifact bytes agree with direct invocation; conflicting parameters return a stable error |
+| AI tool boundary | Production Spring AI callback and ReACT agent parser/dispatcher → schema binding → validation → native execution → publication → JSON result; callback artifact bytes agree with direct invocation; agent artifact pixels/properties checked; conflicting parameters retain stable errors; malformed JSON does not invoke native work |
 
 These are deterministic generated-reference tests, not an exhaustive photographic
 color corpus or a security certification. The callback test does not run an LLM,

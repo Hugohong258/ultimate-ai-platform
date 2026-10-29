@@ -162,7 +162,8 @@ class AgentExecutorTest {
                                 .expectNextMatches(event -> event.type() == AgentEvent.EventType.THINK)
                                 .expectNextMatches(event -> event.type() == AgentEvent.EventType.ACT &&
                                                 event.toolName().equals("calculate"))
-                                .expectNextMatches(event -> event.type() == AgentEvent.EventType.OBSERVE)
+                                .expectNextMatches(event -> event.type() == AgentEvent.EventType.OBSERVE &&
+                                                event.data().contains("100"))
                                 .expectNextMatches(event -> event.type() == AgentEvent.EventType.FINAL)
                                 .verifyComplete();
         }

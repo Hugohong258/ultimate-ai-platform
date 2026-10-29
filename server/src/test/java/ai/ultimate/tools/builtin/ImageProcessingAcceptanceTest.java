@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Generated, redistributable reference corpus; assertions inspect actual artifacts. */
@@ -136,7 +137,7 @@ class ImageProcessingAcceptanceTest {
         assertThat(new Color(output.getRGB(8, 8)).getRed()).isBetween(185, 191);
         var profiles = runner.run(List.of(binary, "identify", "-format", "%[profiles]",
                 workspace.resolve("srgb/image-01.png").toString()), workspace, Map.of(), Duration.ofSeconds(5));
-        assertThat(profiles.output()).doesNotContain("icc", "exif");
+        assertMetadataRemoved(profiles);
     }
 
     @Test void executesStructuredSpringAiCallbackAndReturnsTheSameArtifactContract() throws Exception {
@@ -189,7 +190,54 @@ class ImageProcessingAcceptanceTest {
         for (int i = 0; i < 4; i++) assertThat(actual[i]).isEqualTo(reference[mappings[orientation-1][i]]);
         var profiles = runner.run(List.of(binary, "identify", "-format", "%[profiles]",
                 workspace.resolve("oriented/image-01.png").toString()), workspace, Map.of(), Duration.ofSeconds(5));
-        assertThat(profiles.output()).doesNotContain("exif");
+        assertMetadataRemoved(profiles);
+    }
+
+    @Test void metadataInspectionFailureAndTimeoutCannotPassAsAnEmptyProfileList() throws Exception {
+        var missing = runner.run(List.of(binary, "identify", "-format", "%[profiles]",
+                workspace.resolve("missing.png").toString()), workspace, Map.of(), Duration.ofSeconds(5));
+        assertThat(missing.exitCode()).isNotZero();
+        assertThatThrownBy(() -> assertMetadataRemoved(missing)).isInstanceOf(AssertionError.class);
+        assertThatThrownBy(() -> assertMetadataRemoved(new ImageProcessRunner.Result(0, true, "")))
+                .isInstanceOf(AssertionError.class);
+    }
+
+    private static void assertMetadataRemoved(ImageProcessRunner.Result profiles) {
+        assertThat(profiles.timedOut()).as("Metadata inspection must complete").isFalse();
+        assertThat(profiles.exitCode()).as(profiles.output()).isZero();
+        assertThat(profiles.output()).doesNotContain("icc", "exif");
+    }
+
+    @Test void competingBatchesPublishOnlyOneCompleteDirectoryAndRecoverCapacity() throws Exception {
+        var ready = new java.util.concurrent.CyclicBarrier(2);
+        ImageProcessRunner competing = (command, directory, environment, timeout) -> {
+            var result = runner.run(command, directory, environment, timeout);
+            if (command.contains("%m %w %h")) {
+                try { ready.await(10, java.util.concurrent.TimeUnit.SECONDS); }
+                catch (Exception e) { throw new java.io.IOException("Competing batches did not reach publication", e); }
+            }
+            return result;
+        };
+        var racedTool = new ImageProcessingTool(temporary.resolve("managed"), binary, competing, Duration.ofSeconds(30));
+        byte[] source = Files.readAllBytes(workspace.resolve("alpha.png"));
+        try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var attempts = List.of("png", "jpeg").stream().map(format -> workers.submit(() -> JSON.readTree(
+                    racedTool.processImages(workspace.toString(), List.of("alpha.png"), ".", "competing", "convert", format,
+                            0, 0, 0, 0, 100, 0, 0, "")))).toList();
+            JsonNode first = attempts.get(0).get(30, java.util.concurrent.TimeUnit.SECONDS);
+            JsonNode second = attempts.get(1).get(30, java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(List.of(first.path("code").asText(), second.path("code").asText()))
+                    .containsExactlyInAnyOrder("OK", "IO_ERROR");
+            JsonNode winner = first.path("code").asText().equals("OK") ? first : second;
+            Path artifact = workspace.resolve(winner.path("artifacts").get(0).path("path").asText());
+            try (var files = Files.list(workspace.resolve("competing"))) { assertThat(files.toList()).containsExactly(artifact); }
+            assertThat(ImageIO.read(artifact.toFile()).getWidth()).isEqualTo(64);
+            assertThat(Files.readAllBytes(workspace.resolve("alpha.png"))).isEqualTo(source);
+        }
+        try (var files = Files.list(workspace)) {
+            assertThat(files.map(path -> path.getFileName().toString())).noneMatch(name -> name.startsWith(".ultimate-image-"));
+        }
+        assertThat(JSON.readTree(convert("alpha.png", "recovered", "png")).path("code").asText()).isEqualTo("OK");
     }
 
     @Test void handlesGrayscaleAndCmykChannelsAndRejectsMalformedOrUnsupportedImages() throws Exception {

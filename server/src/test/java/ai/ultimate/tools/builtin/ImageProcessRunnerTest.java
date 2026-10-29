@@ -46,17 +46,17 @@ class ImageProcessRunnerTest {
     }
 
     @Test void terminatesObservedDescendantsAfterTimeoutAndNormalParentExit() throws Exception {
-        for (String mode : List.of("parent-exits", "parent-sleeps")) {
+        for (String mode : List.of("parent-exits", "parent-sleeps", "parent-pipe-exits", "parent-pipe-sleeps")) {
             Path pidFile = temporary.resolve(mode + ".pid");
             var args = new java.util.ArrayList<>(command(mode));
             args.add(pidFile.toString());
             // Allow cold nested JVM startup on Windows; the sleeping parent still exceeds this budget.
             var result = new ImageProcessRunner.Native().run(args, temporary, Map.of(), Duration.ofSeconds(10));
-            assertThat(result.timedOut()).as(mode + ": " + result.output()).isEqualTo(mode.equals("parent-sleeps"));
+            assertThat(result.timedOut()).as(mode + ": " + result.output()).isEqualTo(mode.endsWith("sleeps"));
             long pid = Long.parseLong(Files.readString(pidFile));
             var child = ProcessHandle.of(pid);
             try {
-                if (child.isPresent()) child.get().onExit().get(3, java.util.concurrent.TimeUnit.SECONDS);
+                // The caller may start scratch cleanup as soon as run returns.
                 assertThat(ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false)).isFalse();
             } finally { child.ifPresent(ProcessHandle::destroyForcibly); }
         }
@@ -91,13 +91,18 @@ class ImageProcessRunnerTest {
                         "-cp", System.getProperty("java.class.path"), Probe.class.getName(), "pid-sleep"));
                 child.add(args[1]);
                 child.add("1200"); // exercise a child that cannot publish readiness within the old 800ms delay
-                new ProcessBuilder(child).redirectOutput(ProcessBuilder.Redirect.DISCARD)
-                        .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+                var childBuilder = new ProcessBuilder(child);
+                if (args[0].contains("-pipe-")) {
+                    childBuilder.redirectOutput(ProcessBuilder.Redirect.INHERIT).redirectError(ProcessBuilder.Redirect.INHERIT);
+                } else {
+                    childBuilder.redirectOutput(ProcessBuilder.Redirect.DISCARD).redirectError(ProcessBuilder.Redirect.DISCARD);
+                }
+                childBuilder.start();
                 long readyDeadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
                 while (!Files.exists(Path.of(args[1])) && System.nanoTime() < readyDeadline) Thread.sleep(10);
                 if (!Files.exists(Path.of(args[1]))) throw new java.io.IOException("Child did not publish its PID");
                 System.out.println("child-started");
-                Thread.sleep(args[0].equals("parent-exits") ? 800 : 15_000);
+                Thread.sleep(args[0].endsWith("exits") ? 800 : 15_000);
                 System.out.println("parent-returning");
                 return;
             }
